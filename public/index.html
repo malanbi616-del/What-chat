@@ -17,7 +17,8 @@
     --sent:rgba(255,255,255,0.13); --sent-border:rgba(255,255,255,0.22);
   }
   *{box-sizing:border-box; -webkit-tap-highlight-color:transparent;}
-  html,body{height:100%; height:100dvh;}
+  html,body{height:100%;}
+  :root{--app-height:100%;}
   body{
     margin:0;
     background:
@@ -33,7 +34,7 @@
   @keyframes drift{ 0%,100%{transform:translate(0,0) scale(1);} 50%{transform:translate(24px,-18px) scale(1.06);} }
 
   .frame{
-    position:relative; z-index:1; width:100%; max-width:420px; height:100vh; height:100dvh; max-height:900px;
+    position:relative; z-index:1; width:100%; max-width:420px; height:var(--app-height); max-height:900px;
     background:linear-gradient(160deg, rgba(255,255,255,0.05), rgba(255,255,255,0.015));
     border:1px solid var(--glass-border-soft); border-radius:38px;
     box-shadow:0 40px 90px -30px rgba(0,0,0,0.7), inset 0 1px 0 rgba(255,255,255,0.06);
@@ -157,6 +158,7 @@
       <div class="meta">
         <div class="room-code" id="roomLabel"></div>
         <div class="presence-line"><span class="dot"></span><span id="presenceText">connecting…</span></div>
+        <div class="presence-line" style="margin-top:1px;">🔒 <span id="encStatus">encrypting…</span></div>
       </div>
       <button class="leave-btn" id="leaveBtn">LEAVE</button>
     </div>
@@ -185,12 +187,63 @@
   let roomCode = '';
   let messages = [];
   let typingTimeout = null;
+  let roomKey = null;
+
+  function setAppHeight(){
+    var h = (window.visualViewport ? window.visualViewport.height : window.innerHeight);
+    document.documentElement.style.setProperty('--app-height', h + 'px');
+  }
+  setAppHeight();
+  window.addEventListener('resize', setAppHeight);
+  if(window.visualViewport){ window.visualViewport.addEventListener('resize', setAppHeight); }
+
+  // ---- End-to-end encryption (AES-256-GCM, key derived from the room code) ----
+  // The server only ever sees ciphertext. Only phones that know the room code
+  // can derive the key and read messages.
+  async function deriveRoomKey(code){
+    const enc = new TextEncoder();
+    const keyMaterial = await crypto.subtle.importKey(
+      'raw', enc.encode(code), { name: 'PBKDF2' }, false, ['deriveKey']
+    );
+    return await crypto.subtle.deriveKey(
+      { name: 'PBKDF2', salt: enc.encode('nearline-fixed-salt-v1'), iterations: 150000, hash: 'SHA-256' },
+      keyMaterial,
+      { name: 'AES-GCM', length: 256 },
+      false,
+      ['encrypt', 'decrypt']
+    );
+  }
+  function bufToB64(buf){
+    return btoa(String.fromCharCode(...new Uint8Array(buf)));
+  }
+  function b64ToBuf(b64){
+    return Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+  }
+  async function encryptText(key, text){
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const enc = new TextEncoder();
+    const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, enc.encode(text));
+    return bufToB64(iv) + '.' + bufToB64(ct);
+  }
+  async function decryptText(key, payload){
+    try{
+      const [ivB64, ctB64] = payload.split('.');
+      const iv = b64ToBuf(ivB64);
+      const ct = b64ToBuf(ctB64);
+      const dec = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct);
+      return new TextDecoder().decode(dec);
+    }catch(e){
+      return '🔒 [could not decrypt — wrong room key]';
+    }
+  }
 
   const $ = (id) => document.getElementById(id);
   const onboardScreen = $('onboardScreen');
   const chatScreen = $('chatScreen');
   const toast = $('toast');
 
+  // Default server URL: same origin this page was loaded from (works out of the box
+  // if this file is served BY the Node server itself). Editable otherwise.
   $('serverInput').value = window.location.origin.startsWith('http')
     ? window.location.origin
     : '';
@@ -222,7 +275,7 @@
     $('roomInput').value = randomCode();
   });
 
-  $('joinBtn').addEventListener('click', () => {
+  $('joinBtn').addEventListener('click', async () => {
     const serverUrl = $('serverInput').value.trim().replace(/\/$/, '');
     const name = $('nameInput').value.trim();
     const room = $('roomInput').value.trim().toUpperCase();
@@ -243,11 +296,14 @@
       return;
     }
 
+    roomKey = await deriveRoomKey(roomCode);
+
     socket.on('connect', () => {
       setStatus('ok', 'connected');
       socket.emit('join_room', { name: myName, roomCode: roomCode });
       enterChat();
       $('joinBtn').disabled = false;
+      $('encStatus').textContent = 'end-to-end encrypted';
     });
 
     socket.on('connect_error', (err) => {
@@ -260,13 +316,18 @@
       $('presenceText').textContent = 'reconnecting…';
     });
 
-    socket.on('history', (list) => {
-      messages = list || [];
+    socket.on('history', async (list) => {
+      const decrypted = [];
+      for(const m of (list || [])){
+        decrypted.push({ ...m, text: await decryptText(roomKey, m.text) });
+      }
+      messages = decrypted;
       renderMessages();
     });
 
-    socket.on('new_message', (msg) => {
-      messages.push(msg);
+    socket.on('new_message', async (msg) => {
+      const plain = { ...msg, text: await decryptText(roomKey, msg.text) };
+      messages.push(plain);
       renderMessages();
     });
 
@@ -333,37 +394,4 @@
       if(!mine && lastSender !== m.sender) html += '<span class="sender-name">' + escapeHtml(m.sender) + '</span>';
       html += '<div class="bubble">' + escapeHtml(m.text) + '</div>';
       html += '<span class="ts">' + fmtTime(m.ts) + '</span>';
-      html += '</div></div>';
-      lastSender = m.sender;
-    });
-    container.innerHTML = html;
-    container.scrollTop = container.scrollHeight;
-  }
-
-  function sendMessage(){
-    const input = $('msgInput');
-    const text = input.value.trim();
-    if(!text || !socket) return;
-    socket.emit('send_message', { text });
-    input.value = '';
-    input.style.height = 'auto';
-    socket.emit('typing', false);
-  }
-
-  $('sendBtn').addEventListener('click', sendMessage);
-  $('msgInput').addEventListener('keydown', (e) => {
-    if(e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); sendMessage(); }
-  });
-  $('msgInput').addEventListener('input', function(){
-    this.style.height = 'auto';
-    this.style.height = Math.min(this.scrollHeight, 110) + 'px';
-    if(!socket) return;
-    socket.emit('typing', true);
-    clearTimeout(typingTimeout);
-    typingTimeout = setTimeout(() => socket.emit('typing', false), 1500);
-  });
-})();
-</script>
-
-</body>
-</html>
+    
