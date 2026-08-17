@@ -1,16 +1,19 @@
 {
-  "name": "nearline-server",
-  "version": "1.0.0",
-  "description": "Real-time chat backend for Nearline",
+  "name": "cipherlink-private-chat",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Privacy-first two-person encrypted chat relay",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "check": "node --check server.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "socket.io": "^4.7.5"
+    "express": "^4.21.2",
+    "qrcode-generator": "^1.4.4",
+    "socket.io": "^4.8.1"
   }
 }
